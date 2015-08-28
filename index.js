@@ -1,4 +1,3 @@
-
 /**
  * Module dependencies.
  */
@@ -46,11 +45,13 @@ function adapter(uri, opts){
   var port = Number(opts.port || 6379);
   var pub = opts.pubClient;
   var sub = opts.subClient;
+  var pubsub = opts.pubsubClient;
   var prefix = opts.key || 'socket.io';
 
   // init clients if needed
   if (!pub) pub = redis(port, host);
   if (!sub) sub = redis(port, host, { detect_buffers: true });
+  if (!pubsub) pubsub = redis(port, host, { detect_buffers: true });
 
   // this server's key
   var uid = uid2(6);
@@ -65,6 +66,7 @@ function adapter(uri, opts){
   function Redis(nsp){
     Adapter.call(this, nsp);
 
+    this.nsp = nsp;
     this.uid = uid;
     this.prefix = prefix;
     this.pubClient = pub;
@@ -74,6 +76,15 @@ function adapter(uri, opts){
     sub.subscribe(prefix + '#' + nsp.name + '#', function(err){
       if (err) self.emit('error', err);
     });
+
+    sub.subscribe(prefix + '#' + nsp.name + '#clientrequest', function(err){
+      if (err) self.emit('error', err);
+    });
+
+    sub.subscribe(prefix + '#' + nsp.name + '#clientresponse', function(err){
+      if (err) self.emit('error', err);
+    });
+
     sub.on('message', this.onmessage.bind(this));
   }
 
@@ -90,6 +101,18 @@ function adapter(uri, opts){
    */
 
   Redis.prototype.onmessage = function(channel, msg){
+    var pieces = channel.split('#');
+    var str = pieces.pop();
+    switch (str) {
+    case 'clientrequest':
+      this.onclientrequest(channel, msg);
+      return;
+      break;
+    case 'clientresponse':
+      return;
+      break;
+    }
+
     var args = msgpack.decode(msg);
     var packet;
 
@@ -108,6 +131,18 @@ function adapter(uri, opts){
     args.push(true);
 
     this.broadcast.apply(this, args);
+  };
+
+  Redis.prototype.onclientrequest = function(channel, msg){
+    var self = this;
+    var args = msgpack.decode(msg);
+    if (uid == args.shift()) return debug('ignore same uid');
+    var muid = args.shift();
+    var rooms = args.shift();
+    Adapter.prototype.clients.call(this, rooms, function(err, sids) {
+      if (err) return;
+      pub.publish(prefix + '#' + self.nsp.name + '#clientresponse', msgpack.encode([muid, sids]));
+    });
   };
 
   /**
@@ -236,6 +271,50 @@ function adapter(uri, opts){
       }
       delete self.sids[id];
       if (fn) fn(null);
+    });
+  };
+
+
+  /**
+   * Gets a list of clients by sid.
+   *
+   * @param {Array} explicit set of rooms to check.
+   * @api public
+   */
+
+  Redis.prototype.clients = function(rooms, fn){
+    var self = this;
+
+    Adapter.prototype.clients.call(this, rooms, function(err, sids){
+      if (err) return fn && fn(err);
+
+      sids = sids || [];
+      pubsub.pubsub('NUMSUB', prefix + '#' + self.nsp.name + '#clientrequest', function (err, subs){
+        if (err) return fn && fn(err);
+
+        var handle = setTimeout(finish, 10);
+        var remaining = subs.pop() - 1;
+        var muid = uid2(6);
+        var packet = [uid, muid, rooms];
+
+        pub.publish(prefix + '#' + self.nsp.name + '#clientrequest', msgpack.encode(packet));
+        sub.on('message', onclientresponsemessage);
+
+        function onclientresponsemessage(channel, message){
+          var pieces = channel.split('#');
+          if ('clientresponse' !== pieces.pop()) return;
+          var response = msgpack.decode(message);
+          if (muid !== response.shift()) return debug('ignore different client response');
+          sids.push.apply(sids, response[0]);
+          --remaining || finish();
+        }
+
+        function finish(){
+          sub.removeListener('message', onclientresponsemessage);
+          clearTimeout(handle);
+          fn && fn(null, sids);
+        }
+      });
     });
   };
 
